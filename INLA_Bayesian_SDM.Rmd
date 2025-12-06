@@ -1,0 +1,1833 @@
+---
+title: "Bayesian SDM"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+params:
+  type: MC
+  region: Idaho
+  normalize: true
+  work.dir: /projects/MC_prediction
+  data.dir: /projects/MC-data/
+---
+
+
+
+```{r packages, message=FALSE, warning=FALSE}
+library(sf)
+library(raster)
+library(ggplot2)
+library(INLA)
+library(inlabru)
+library(lubridate)
+library(fmesher)
+library(dplyr)
+library(Metrics)   # rmse, mae
+library(caret)
+library(reshape2)
+library(viridis)
+
+```
+
+
+
+```{r survey_locations}
+set.seed(1)
+
+research.year <- seq(2015, 2019) # Training years
+print ("Training years:")
+print (research.year)
+
+survey.type <- params$type # Mormon cricket
+region.name <- params$region # Wyoming | Nevada | Idaho
+
+if (region.name == "Wyoming") {
+  region.code <- "WY"
+  } else if (region.name == "Nevada") {
+    region.code <-  "NV"
+  } else {
+    region.code <-  "ID"
+  }
+
+paste(survey.type, region.name, "(previous Sept. to this Aug., 12 months for biovars)")
+
+setwd(params$work.dir) 
+inla.setOption("working.directory", params$work.dir)
+
+root_folder <- params$data.dir
+paste("Working directory: ", params$work.dir)
+paste("Dataset directory: ", params$data.dir)
+
+if (region.name == "Nevada") {
+  bound_folder <- "NV_data"
+  }else if (region.name == "Wyoming") {
+    bound_folder  <-  "WY_data"
+  }else{
+    bound_folder  <-  "ID_data"
+  }
+
+template_dataMerge <- raster(paste0(root_folder, bound_folder, "/DEM_", region.code, "_UTM.tif"))
+
+data <- data.frame()
+for (year in research.year){
+  path.survey <- paste0(root_folder, "SurveyData/grasshoppers_10192022/APHIS_split_GH_MC/GHMC_Survey_", year, "_", survey.type,"_", region.code, "_UTM_wabs.csv")
+  survey <- read.csv(path.survey)
+  survey <- survey[survey$STATE==region.code, c("X", "Y", "DATE","MCDENSITY")]
+ 
+  if (nrow(survey) == 0) next
+
+  
+  survey$DATE <- parse_date_time(survey$DATE, orders = c(
+  "Y/m/d H:M",   # e.g., 2003/8/31 0:00
+  "m/d/Y H:M",   # e.g., 8/31/2003 0:00
+  "Y-m-d H:M",   # e.g., 2003-08-31 00:00
+  "Y/m/d",       # fallback
+  "m/d/Y"        # fallback
+  ))
+
+  # Extract the year
+  survey$YEAR <- year(survey$DATE)
+  
+  survey$group <- survey$YEAR - research.year[1] +1
+  
+  # deal with the samples located in the same pixel
+  xy <- survey[, c("X", "Y")]
+  
+  cells <- cellFromXY(template_dataMerge, xy)
+  survey$cell_id <- cells
+  
+  survey.ras <- survey %>%
+  group_by(cell_id) %>%
+  summarise(
+    MCDENSITY = round(mean(MCDENSITY, na.rm = TRUE)),
+    YEAR = first(YEAR),
+    group = first(group)
+    ) %>%
+  ungroup()
+    
+  xy_centers <- xyFromCell(template_dataMerge, survey.ras$cell_id)
+  survey.ras$X <- xy_centers[, 1]
+  survey.ras$Y <- xy_centers[, 2]
+
+  pest_name <- paste0(survey.type, "DENSITY")
+
+  survey.ras <- survey.ras[, c("X", "Y", "YEAR", "group", pest_name)]
+  
+  data <- rbind(data, survey.ras)
+}
+
+research.boundary <- sf::st_read(dsn = paste0(root_folder, bound_folder, "/cb_2018_us_state_500k_",region.name,"_UTM.shp"),
+                                layer = paste0("cb_2018_us_state_500k_", region.name, "_UTM"), quiet=TRUE)
+research.crs <- crs(research.boundary)
+
+data.sf <- sf::st_as_sf(data, coords = c("X","Y"), crs=research.crs)
+```
+
+```{r Load climate datasets}
+dataset.all <- list()
+template_raster <- NULL
+
+# define inputs
+if (region.name == "Wyoming") {
+  wanted_names <- c("Bio6", "Bio8", "Bio17", "Bio18", 
+                  "ndvi.fall.pr", "ndvi.winter.pr", "ndvi.spring", "ndvi.summer",
+                  "soil.moisture.fall.pr", "soil.moisture.winter.pr", "soil.moisture.spring", "soil.moisture.summer",
+                  "dem", "slope", "aspect", "tri", "dayT")
+  }else if (region.name == "Nevada") {
+    wanted_names <- c("Bio8", "Bio9", "Bio14", "Bio18", 
+                  "ndvi.fall.pr", "ndvi.winter.pr", "ndvi.spring", "ndvi.summer",
+                  "soil.moisture.fall.pr", "soil.moisture.winter.pr", "soil.moisture.spring", "soil.moisture.summer",
+                  "dem", "slope", "aspect", "tri", "dayT")
+  }else{
+    wanted_names <- c("Bio8", "Bio9", "Bio17", "Bio19", 
+                  "ndvi.fall.pr", "ndvi.winter.pr", "ndvi.spring", "ndvi.summer",
+                  "soil.moisture.fall.pr", "soil.moisture.winter.pr", "soil.moisture.spring", "soil.moisture.summer",
+                  "dem", "slope", "aspect", "tri", "dayT")
+  } 
+
+
+for (year in research.year){
+  path.dataset <- paste0("Datasets/", region.name, "/Dataset.", region.name, ".", year, "_biovar_UTM_fall_pr_summer.Rds")
+  full_data <- readRDS(path.dataset)
+  # select biovars
+  filtered_data <- full_data[names(full_data) %in% wanted_names]
+  
+  # number of days whose temperature are between 20 and 35 degrees Celsius 
+  path.dayT <- paste0(root_folder, "DayinRangeTEco/", region.name, "/", region.code,"_DaysInRange_EcoYear_", year, "_UTM.tif")
+  if (file.exists(path.dayT)) {
+    dayT_raster <- raster::raster(path.dayT)
+    if (inherits(dayT_raster, "Raster")) {
+      filtered_data$dayT <- dayT_raster
+    }
+  }
+  
+  dataset.all[[paste0('year.', year)]] <- filtered_data
+  
+  # Pick a template raster (first valid one)
+  if (is.null(template_raster)) {
+    for (r in filtered_data) {
+      if (inherits(r, "RasterLayer")) {
+        template_raster <- r
+        break
+      }
+    }
+  }
+  
+}
+
+# bio-climate variables images have different size
+# Resample all rasters to match template
+for (year_name in names(dataset.all)) {
+  selected_data <- dataset.all[[year_name]]
+  
+  aligned_data <- list()
+  
+  for (name in wanted_names) {
+    if (!is.null(selected_data[[name]]) && inherits(selected_data[[name]], "Raster")) {
+      aligned_data[[name]] <- raster::resample(selected_data[[name]], template_raster, method = "bilinear")
+    } else {
+      # Fill with NA if missing or not a RasterLayer
+      aligned_data[[name]] <- raster(template_raster)
+      aligned_data[[name]][] <- NA
+    }
+  }
+  
+  dataset.all[[year_name]] <- aligned_data
+}
+
+```
+
+```{r plot all sampling sites in 5 years}
+ggplot(research.boundary) + geom_sf() + coord_sf(datum = st_crs(research.boundary)) +
+  geom_point(data = data, aes(x = X, y = Y)) + theme_bw()
+```
+
+```{r data histogram}
+ggplot(data) +
+  geom_histogram(mapping = aes(x = MCDENSITY), binwidth = 1) +
+  facet_wrap(~YEAR, ncol = 1) +
+  theme_bw()
+```
+
+```{r MCDENSITY map}
+
+ggplot(research.boundary) + geom_sf() + coord_sf(datum = NA) +
+  geom_point(
+    data = data, aes(x = X, y = Y, color = MCDENSITY),
+    size = 1
+  ) +
+  labs(x = "", y = "") +
+  scale_color_viridis() +
+  facet_wrap(~YEAR) +
+  theme_bw()
+```
+
+
+```{r create mesh}
+
+# Domain
+mesh <- fmesher::fm_mesh_2d_inla(
+  loc = st_intersection(st_as_sfc(data.sf), st_buffer(research.boundary, -5)),
+  boundary=research.boundary,
+  max.edge = c(30000, 70000),
+  cutoff = 1000,
+  crs=research.crs)
+
+
+summary(mesh)
+# The number of vertices of the mesh 
+print(paste("The number of vertices of the mesh:", mesh$n))
+
+ggplot() +
+  geom_fm(data = mesh) +
+  geom_sf(
+    data = data.sf[data.sf$MCDENSITY > 0, ],
+    aes(color = MCDENSITY), # Color is mapped to the PEST DENSITY value.
+    size = 1,
+    pch = 4
+  ) +
+  theme_minimal()
+
+```
+
+```{r define sped}
+
+spde <- INLA::inla.spde2.pcmatern(
+  mesh,
+  prior.sigma = c(0.01, 0.05), # prior on sigma: P(sigma > sigma0) = 0.05
+  prior.range = c(15000, 0.05) # prior on range: P(range < range0) = 0.05
+)
+```
+
+```{r functions to get covariates values}
+
+get.climateVars <- function(data, geometry){
+  # Extract pixel value from data for given location (geometry)
+  values <- raster::extract(data, st_as_sf(geometry, crs=research.crs))
+  if (any(is.na(values))) {
+    # missing value will be filled with 0
+    values[is.na(values)] <- 0.0
+  }
+  return (values)
+}
+
+
+get.climateVars.yearly <- function(geometry, year, varName){
+  year <- research.year[year]
+  values <- list()
+  for (y in unique(year)){
+    values[year==y] <- get.climateVars(dataset.all[[paste0('year.', y)]][[varName]], geometry[year==y])
+  }
+  return (as.numeric(values))
+}
+
+
+```
+
+
+```{r normalization all images for 5 years}
+
+if (params$normalize){
+  data.normalize <- function(data) ((data - cellStats(data, stat='mean')) / cellStats(data, stat='sd'))
+}
+for (i in 1:length(dataset.all)) {
+  for (j in 1:length(dataset.all[[i]])) {
+    dataset.all[[i]][[j]] <- data.normalize(dataset.all[[i]][[j]])
+  }
+}
+
+```
+
+
+```{r add climate variables}
+
+# get image values
+data$dem <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'dem')
+data$slope <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'slope')
+data$aspect <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'aspect')
+data$tri <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'tri')
+
+
+data$ndvi.fall.pr <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'ndvi.fall.pr')
+data$ndvi.winter.pr <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'ndvi.winter.pr')
+data$ndvi.spring <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'ndvi.spring')
+data$ndvi.summer <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'ndvi.summer')
+
+data$soil.moisture.fall.pr <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'soil.moisture.fall.pr')
+data$soil.moisture.winter.pr <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'soil.moisture.winter.pr')
+data$soil.moisture.spring <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'soil.moisture.spring')
+data$soil.moisture.summer <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'soil.moisture.summer')
+
+data$dayT <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'dayT')
+
+if (region.name == "Wyoming") {
+  data$Bio6 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio6')
+  data$Bio8 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio8')
+  data$Bio17 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio17')
+  data$Bio18 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio18')
+  }else if (region.name == "Nevada") {
+    data$Bio8 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio8')
+    data$Bio9 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio9')
+    data$Bio14 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio14')
+    data$Bio18 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio18')
+  }else {
+    data$Bio8 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio8')
+    data$Bio9 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio9')
+    data$Bio17 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio17')
+    data$Bio19 <- get.climateVars.yearly(data.sf$geometry, data.sf$group, 'Bio19')
+  
+  }
+
+```
+
+
+```{r index set}
+timesn <- length(unique(data$YEAR))
+indexs <- inla.spde.make.index("s",
+  n.spde = spde$n.spde, # The number of vertices of the mesh
+  n.group = timesn # 5 years
+)
+lengths(indexs)
+# s: indices of the SPDE vertices repeated the number of times,
+# s.group: indices of the times repeated the number of mesh vertices,
+# s.repl: vector of 1 with length given by the number of mesh vertices times the number of times (spde$n.spde*timesn).
+```
+
+
+```{r projection matrix}
+# projects the spatio-temporal continuous Gaussian random field from the observations to the mesh nodes
+group <- data$YEAR - min(data$YEAR) + 1
+coo <- cbind(data$X, data$Y)
+A <- inla.spde.make.A(mesh = mesh, loc = coo, group = group)
+```
+
+```{r check NAN}
+# check NAN
+check.isna.climateVars <- function(dataset, loc){
+  loc_idx <- rep(TRUE, nrow(loc))
+  for (idx in 1:length(dataset)){
+    values <- get.climateVars(dataset[[idx]], SpatialPoints(coords = loc))
+    if (any(is.na(values))) loc_idx <- loc_idx & !is.na(values)
+  }
+  return (loc_idx)
+}
+
+```
+
+```{r create prediction grid, adding covariates to prediction coor}
+path.pred.grid <- paste0("Datasets/", region.name, "/", survey.type, "/Pred.grid.", region.name, ".", survey.type, ".", research.year[1],"-", research.year[5], ".Rds")
+
+if (!file.exists(path.pred.grid)){
+  
+  pred.grid <- read.csv(paste0(root_folder, bound_folder, "/", region.name, "_grid_1km_UTM.csv"))
+  check_results <- list()
+
+  for (year in research.year) {
+    selected_points <- pred.grid[check.isna.climateVars(dataset.all[[paste0('year.', year)]], pred.grid),]
+    selected_points$YEAR <- year-research.year[1]+1  # add year
+  
+    # to sf
+    sf_selected <- st_as_sf(selected_points, coords = c("X", "Y"), crs=research.crs)
+  
+    # save into list
+    check_results[[as.character(year)]] <- sf_selected
+  }
+  
+  # combine all data
+  final_sf <- do.call(rbind, check_results) # group number and POINT(x,y)
+
+  
+  # get image values
+  final_sf$dem <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'dem')
+  final_sf$slope <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'slope')
+  final_sf$aspect <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'aspect')
+  final_sf$tri <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'tri')
+  
+  final_sf$ndvi.fall.pr <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'ndvi.fall.pr')
+  final_sf$ndvi.winter.pr <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'ndvi.winter.pr')
+  final_sf$ndvi.spring <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'ndvi.spring')
+  final_sf$ndvi.summer <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'ndvi.summer')
+
+  final_sf$soil.moisture.fall.pr <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'soil.moisture.fall.pr')
+  final_sf$soil.moisture.winter.pr <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'soil.moisture.winter.pr')
+  final_sf$soil.moisture.spring <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'soil.moisture.spring')
+  final_sf$soil.moisture.summer <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'soil.moisture.summer')
+  
+  final_sf$dayT <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'dayT')
+  
+  if (region.name == "Wyoming") {
+    final_sf$Bio6 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio6')
+    final_sf$Bio8 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio8')
+    final_sf$Bio17 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio17')
+    final_sf$Bio18 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio18')
+    }else if (region.name == "Nevada") {
+      final_sf$Bio8 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio8')
+      final_sf$Bio9 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio9')
+      final_sf$Bio14 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio14')
+      final_sf$Bio18 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio18')
+      }else {
+        final_sf$Bio8 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio8')
+        final_sf$Bio9 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio9')
+        final_sf$Bio17 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio17')
+        final_sf$Bio19 <- get.climateVars.yearly(final_sf$geometry, final_sf$YEAR, 'Bio19')
+      }
+  
+  saveRDS(final_sf, file = path.pred.grid)
+} else {
+  final_sf <- readRDS(path.pred.grid)
+}
+
+```
+
+
+```{r matrix}
+# projects the spatially continuous Gaussian random field from the prediction locations to the mesh nodes
+coop <- st_coordinates(final_sf$geometry)
+groupp <- final_sf$YEAR
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop, group = groupp)
+```
+
+```{r Stack with data for estimation and prediction}
+
+if (region.name == "Wyoming"){
+  stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = data$MCDENSITY),
+  A = list(1, A),
+  effects = list(data.frame(b0 = rep(1, nrow(data)), 
+                            
+                            dem = data$dem, 
+                            slope = data$slope, 
+                            aspect = data$aspect, 
+                            tri = data$tri, 
+                    
+                            ndvi.fall.pr = data$ndvi.fall.pr,
+                            ndvi.winter.pr = data$ndvi.winter.pr,
+                            ndvi.spring = data$ndvi.spring,
+                            ndvi.summer = data$ndvi.summer,
+
+                            soil.moisture.fall.pr = data$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = data$soil.moisture.winter.pr,
+                            soil.moisture.spring = data$soil.moisture.spring,
+                            soil.moisture.summer = data$soil.moisture.summer,
+                            
+                            Bio6 = data$Bio6,
+                            Bio8 = data$Bio8,
+                            Bio17 = data$Bio17,
+                            Bio18 = data$Bio18,
+                            
+                            dayT = data$dayT
+                            
+                            ), 
+                 s = indexs)
+  )
+
+  stk.p <- inla.stack(
+    tag = "pred",
+    data = list(y = NA),
+    A = list(1, Ap),
+    effects = list(data.frame(b0 = rep(1, nrow(final_sf)), 
+                              
+                              dem = final_sf$dem, 
+                              slope = final_sf$slope,
+                              aspect = final_sf$aspect,
+                              tri = final_sf$tri,
+                              
+                              
+                              ndvi.fall.pr = final_sf$ndvi.fall.pr,
+                              ndvi.winter.pr = final_sf$ndvi.winter.pr,
+                              ndvi.spring = final_sf$ndvi.spring,
+                              ndvi.summer = final_sf$ndvi.summer,
+  
+                              soil.moisture.fall.pr = final_sf$soil.moisture.fall.pr,
+                              soil.moisture.winter.pr = final_sf$soil.moisture.winter.pr,
+                              soil.moisture.spring = final_sf$soil.moisture.spring,
+                              soil.moisture.summer = final_sf$soil.moisture.summer,
+                              
+                              Bio6 = final_sf$Bio6,
+                              Bio8 = final_sf$Bio8,
+                              Bio17 = final_sf$Bio17,
+                              Bio18 = final_sf$Bio18,
+                              
+                              dayT = final_sf$dayT
+                              
+                              ), 
+                   s = indexs)
+  )
+  
+}else if (region.name == "Nevada"){
+    stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = data$MCDENSITY),
+  A = list(1, A),
+  effects = list(data.frame(b0 = rep(1, nrow(data)), 
+                            
+                            dem = data$dem, 
+                            slope = data$slope, 
+                            aspect = data$aspect, 
+                            tri = data$tri, 
+                    
+                            ndvi.fall.pr = data$ndvi.fall.pr,
+                            ndvi.winter.pr = data$ndvi.winter.pr,
+                            ndvi.spring = data$ndvi.spring,
+                            ndvi.summer = data$ndvi.summer,
+
+                            soil.moisture.fall.pr = data$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = data$soil.moisture.winter.pr,
+                            soil.moisture.spring = data$soil.moisture.spring,
+                            soil.moisture.summer = data$soil.moisture.summer,
+                            
+                            Bio8 = data$Bio8,
+                            Bio9 = data$Bio9,
+                            Bio14 = data$Bio14,
+                            Bio18 = data$Bio18,
+                            
+                            dayT = data$dayT
+                            
+                            ), 
+                 s = indexs)
+  )
+
+  stk.p <- inla.stack(
+    tag = "pred",
+    data = list(y = NA),
+    A = list(1, Ap),
+    effects = list(data.frame(b0 = rep(1, nrow(final_sf)), 
+                              
+                              dem = final_sf$dem, 
+                              slope = final_sf$slope,
+                              aspect = final_sf$aspect,
+                              tri = final_sf$tri,
+                              
+                              
+                              ndvi.fall.pr = final_sf$ndvi.fall.pr,
+                              ndvi.winter.pr = final_sf$ndvi.winter.pr,
+                              ndvi.spring = final_sf$ndvi.spring,
+                              ndvi.summer = final_sf$ndvi.summer,
+  
+                              soil.moisture.fall.pr = final_sf$soil.moisture.fall.pr,
+                              soil.moisture.winter.pr = final_sf$soil.moisture.winter.pr,
+                              soil.moisture.spring = final_sf$soil.moisture.spring,
+                              soil.moisture.summer = final_sf$soil.moisture.summer,
+                              
+                              Bio8 = final_sf$Bio8,
+                              Bio9 = final_sf$Bio9,
+                              Bio14 = final_sf$Bio14,
+                              Bio18 = final_sf$Bio18,
+                              
+                              dayT = final_sf$dayT
+                              
+                              ), 
+                   s = indexs)
+  )
+}else{
+    stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = data$MCDENSITY),
+  A = list(1, A),
+  effects = list(data.frame(b0 = rep(1, nrow(data)), 
+                            
+                            dem = data$dem, 
+                            slope = data$slope, 
+                            aspect = data$aspect, 
+                            tri = data$tri, 
+                    
+                            ndvi.fall.pr = data$ndvi.fall.pr,
+                            ndvi.winter.pr = data$ndvi.winter.pr,
+                            ndvi.spring = data$ndvi.spring,
+                            ndvi.summer = data$ndvi.summer,
+
+                            soil.moisture.fall.pr = data$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = data$soil.moisture.winter.pr,
+                            soil.moisture.spring = data$soil.moisture.spring,
+                            soil.moisture.summer = data$soil.moisture.summer,
+                            
+                            Bio8 = data$Bio8,
+                            Bio9 = data$Bio9,
+                            Bio17 = data$Bio17,
+                            Bio19 = data$Bio19,
+                            
+                            dayT = data$dayT
+                            
+                            ), 
+                 s = indexs)
+  )
+
+  stk.p <- inla.stack(
+    tag = "pred",
+    data = list(y = NA),
+    A = list(1, Ap),
+    effects = list(data.frame(b0 = rep(1, nrow(final_sf)), 
+                              
+                              dem = final_sf$dem, 
+                              slope = final_sf$slope,
+                              aspect = final_sf$aspect,
+                              tri = final_sf$tri,
+                              
+                              
+                              ndvi.fall.pr = final_sf$ndvi.fall.pr,
+                              ndvi.winter.pr = final_sf$ndvi.winter.pr,
+                              ndvi.spring = final_sf$ndvi.spring,
+                              ndvi.summer = final_sf$ndvi.summer,
+  
+                              soil.moisture.fall.pr = final_sf$soil.moisture.fall.pr,
+                              soil.moisture.winter.pr = final_sf$soil.moisture.winter.pr,
+                              soil.moisture.spring = final_sf$soil.moisture.spring,
+                              soil.moisture.summer = final_sf$soil.moisture.summer,
+                              
+                              Bio8 = final_sf$Bio8,
+                              Bio9 = final_sf$Bio9,
+                              Bio17 = final_sf$Bio17,
+                              Bio19 = final_sf$Bio19,
+                              
+                              dayT = final_sf$dayT
+                              
+                              ), 
+                   s = indexs)
+  )
+}
+
+
+
+stk.full <- inla.stack(stk.e, stk.p)
+```
+
+```{r Model formula}
+if (region.name == "Wyoming"){
+  rprior <- list(theta = list(prior = "pccor1", param = c(0.4, 0.6)))
+  
+  formula <- y ~ 0 + b0 +
+  dem + slope + aspect + tri +
+  ndvi.fall.pr + ndvi.winter.pr + ndvi.spring + ndvi.summer +
+  soil.moisture.fall.pr + soil.moisture.winter.pr + soil.moisture.spring + soil.moisture.summer +
+  Bio6 + Bio8 + Bio17 + Bio18 +
+  dayT +
+  
+  f(s,model = spde, group = s.group,
+  control.group = list(model = "ar1", hyper = rprior)
+)
+} else if (region.name == "Nevada") {
+  rprior <- list(theta = list(prior = "pccor1", param = c(0.8, 0.4)))
+  
+  formula <- y ~ 0 + b0 +
+  dem + slope + aspect + tri +
+  ndvi.fall.pr + ndvi.winter.pr + ndvi.spring + ndvi.summer +
+  soil.moisture.fall.pr + soil.moisture.winter.pr + soil.moisture.spring + soil.moisture.summer +
+  Bio8 + Bio9 + Bio14 + Bio18 +
+  dayT +
+  
+  f(s,model = spde, group = s.group,
+  control.group = list(model = "ar1", hyper = rprior)
+)
+} else {
+  rprior <- list(theta = list(prior = "pccor1", param = c(0.4, 0.6)))
+  
+  formula <- y ~ 0 + b0 +
+  dem + slope + aspect + tri +
+  ndvi.fall.pr + ndvi.winter.pr + ndvi.spring + ndvi.summer +
+  soil.moisture.fall.pr + soil.moisture.winter.pr + soil.moisture.spring + soil.moisture.summer +
+  Bio8 + Bio9 + Bio17 + Bio19 +
+  dayT +
+  
+  f(s,model = spde, group = s.group,
+  control.group = list(model = "ar1", hyper = rprior)
+)
+}
+
+
+
+
+```
+
+
+```{r inla}
+
+path.model <- paste0("Models/", region.name, "/", survey.type, "/Model.INLA.", region.name, ".", survey.type, ".", research.year[1],"-", research.year[5], ".Rds")
+
+
+inla.models()$latent$rw1$constr
+if (!file.exists(path.model)){
+  res <- inla(formula,
+              family = "zeroinflatedpoisson1",
+  data = inla.stack.data(stk.full, spde=spde),
+  control.predictor = list(
+    compute = TRUE,#estimate fitted values
+    A = inla.stack.A(stk.full),
+    link = 1
+  ),
+  control.compute=list(config = TRUE,dic = TRUE, waic = TRUE)
+)  
+  saveRDS(res, file = path.model)
+} else {
+  res <- readRDS(path.model)
+}
+
+summary(res)
+```
+
+
+```{r plot}
+# create plots of the posterior distributions of the intercept
+# the precision of the measurement error
+# and the standard deviation, range and autocorrelation parameters of the spatio-temporal random effect
+
+
+list_marginals <- list(
+"b0" = res$marginals.fixed$b0,
+"zero-prob parameter for zip_1" =
+res$marginals.hyperpar$"zero-probability parameter for zero-inflated poisson_1",
+"range" = res$marginals.hyperpar$"Range for s",
+"stdev" = res$marginals.hyperpar$"Stdev for s",
+"rho" = res$marginals.hyperpar$"GroupRho for s" #  extract samples for AR1 coefficient in the space-time interactions
+)
+
+
+marginals <- data.frame(do.call(rbind, list_marginals))
+marginals$parameter <- rep(names(list_marginals),
+  times = sapply(list_marginals, nrow)
+)
+
+ggplot(marginals, aes(x = x, y = y)) + geom_line() +
+  facet_wrap(~parameter, scales = "free") +
+  labs(x = "", y = "Density") + theme_bw()
+
+
+```
+
+
+
+
+```{r valid survey data}
+year_valid <- seq(research.year[5], research.year[5] + 1) # test year and the year before it
+
+valid_data <- data.frame()
+for (year in year_valid){
+  path.survey.valid <- paste0(root_folder, "SurveyData/grasshoppers_10192022/APHIS_split_GH_MC/GHMC_Survey_", year, "_", survey.type,"_", region.code, "_UTM_wabs.csv")
+  valid_survey <- read.csv(path.survey.valid)
+  valid_survey <- valid_survey[valid_survey$STATE==region.code, c("X", "Y", "DATE","MCDENSITY")]
+  
+  if (nrow(valid_survey) == 0) next
+  
+  valid_survey$DATE <- parse_date_time(valid_survey$DATE, orders = c(
+  "Y/m/d H:M",   # e.g., 2003/8/31 0:00
+  "m/d/Y H:M",   # e.g., 8/31/2003 0:00
+  "Y-m-d H:M",   # e.g., 2003-08-31 00:00
+  "Y/m/d",       # fallback
+  "m/d/Y"        # fallback
+  ))
+
+  # Extract the year
+  valid_survey$YEAR <- year(valid_survey$DATE)
+ 
+  valid_survey$group <- valid_survey$YEAR - year_valid[1] +1
+  
+  # samples in one pixel
+  valid_xy <- valid_survey[, c("X", "Y")]
+  
+  valid_cells <- cellFromXY(template_dataMerge, valid_xy)
+  valid_survey$cell_id <- valid_cells
+  
+
+  valid_survey.ras <- valid_survey %>%
+    group_by(cell_id) %>%
+    summarise(
+      MCDENSITY = round(mean(MCDENSITY, na.rm = TRUE)),
+    YEAR = first(YEAR),
+    group = first(group)
+    ) %>%
+    ungroup()
+    
+  
+  valid_xy_centers <- xyFromCell(template_dataMerge, valid_survey.ras$cell_id)
+  valid_survey.ras$X <- valid_xy_centers[, 1]
+  valid_survey.ras$Y <- valid_xy_centers[, 2]
+
+  valid_pest_name <- paste0(survey.type, "DENSITY")
+  valid_survey.ras <- valid_survey.ras[, c("X", "Y", "YEAR", "group", valid_pest_name)]  
+  
+  
+  valid_data <- rbind(valid_data, valid_survey.ras)
+}
+
+valid_data <- valid_data[!is.na(valid_data$X) & !is.na(valid_data$Y), ]
+
+```
+
+```{r valid covariate data}
+
+dataset.valid <- list()
+template_raster.valid <- NULL
+
+for (year in year_valid){
+  
+  path.dataset.valid <- paste0("Datasets/", region.name, "/Dataset.", region.name, ".", year, "_biovar_UTM_fall_pr_summer.Rds")
+  filter_data.valid <- readRDS(path.dataset.valid)
+  filter_data.valid <- filter_data.valid[names(filter_data.valid) %in% wanted_names]
+  
+  path.dayT.valid <- paste0(root_folder, "DayinRangeTEco/", region.name, "/", region.code, "_DaysInRange_EcoYear_", year, "_UTM.tif")
+  if (file.exists(path.dayT.valid)) {
+    dayT_raster.valid <- raster::raster(path.dayT.valid)
+    if (inherits(dayT_raster.valid, "Raster")) {
+      filter_data.valid$dayT <- dayT_raster.valid
+    }
+  }
+  
+  # Pick a template raster (first valid one)
+  if (is.null(template_raster.valid)) {
+    for (r in filter_data.valid) {
+      if (inherits(r, "RasterLayer")) {
+        template_raster.valid <- r
+        break
+      }
+    }
+  }
+  
+  
+  
+  dataset.valid[[paste0('year.', year)]] <- filter_data.valid
+}
+
+
+
+# bio-climate variables images have different size
+# Resample all rasters to match template
+for (year_name.valid in names(dataset.valid)) {
+  selected_data.valid <- dataset.valid[[year_name.valid]]
+  
+  aligned_data.valid <- list()
+  
+  for (name in wanted_names) {
+    if (!is.null(selected_data.valid[[name]]) && inherits(selected_data.valid[[name]], "Raster")) {
+      aligned_data.valid[[name]] <- raster::resample(selected_data.valid[[name]], template_raster.valid, method = "bilinear")
+    } else {
+      # Fill with NA if missing or not a RasterLayer
+      aligned_data.valid[[name]] <- raster(template_raster.valid)
+      aligned_data.valid[[name]][] <- NA
+    }
+  }
+  
+  dataset.valid[[year_name.valid]] <- aligned_data.valid ##### year_name.test/valid
+}
+
+
+
+
+# normalize
+for (i in 1:length(dataset.valid)) {
+  for (j in 1:length(dataset.valid[[i]])) {
+    dataset.valid[[i]][[j]] <- data.normalize(dataset.valid[[i]][[j]])
+  }
+}
+
+valid_data.sf <- sf::st_as_sf(valid_data, coords = c("X","Y"), crs=research.crs)
+
+```
+
+```{r valid data processing}
+
+# define function
+get.climateVars.yearly.valid <- function(geometry, year, varName){
+  year <- year_valid[year]
+  values <- list()
+  for (y in unique(year)){
+    values[year==y] <- get.climateVars(dataset.valid[[paste0('year.', y)]][[varName]], geometry[year==y])
+  }
+  return (as.numeric(values))
+}
+
+
+
+# get image values
+valid_data$dem <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'dem')
+valid_data$slope <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'slope')
+valid_data$aspect <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'aspect')
+valid_data$tri <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'tri')
+
+valid_data$ndvi.fall.pr <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'ndvi.fall.pr')
+valid_data$ndvi.winter.pr <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'ndvi.winter.pr')
+valid_data$ndvi.spring <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'ndvi.spring')
+valid_data$ndvi.summer <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'ndvi.summer')
+
+valid_data$soil.moisture.fall.pr <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'soil.moisture.fall.pr')
+valid_data$soil.moisture.winter.pr <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'soil.moisture.winter.pr')
+valid_data$soil.moisture.spring <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'soil.moisture.spring')
+valid_data$soil.moisture.summer <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'soil.moisture.summer')
+
+valid_data$dayT <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'dayT')
+
+if (region.name == "Wyoming") {
+  valid_data$Bio6 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio6')
+  valid_data$Bio8 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio8')
+  valid_data$Bio17 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio17')
+  valid_data$Bio18 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio18')
+} else if (region.name == "Nevada") {
+  valid_data$Bio8 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio8')
+  valid_data$Bio9 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio9')
+  valid_data$Bio14 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio14')
+  valid_data$Bio18 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio18')
+} else {
+  valid_data$Bio8 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio8')
+  valid_data$Bio9 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio9')
+  valid_data$Bio17 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio17')
+  valid_data$Bio19 <- get.climateVars.yearly.valid(valid_data.sf$geometry, valid_data.sf$group, 'Bio19')  
+}
+
+```
+
+
+
+
+
+
+
+```{r pred-validation}
+
+# ==== Create binary labels from MCDENSITY ====
+# Assuming: 1 = presence (MCDENSITY > 0), 0 = absence
+valid_data <- valid_data %>%
+  mutate(label = ifelse(MCDENSITY > 0, 1, 0))
+
+# ==== Build projection matrix for new coordinates ====
+group.valid <- valid_data$YEAR - min(valid_data$YEAR) + 1
+coords.valid <- as.matrix(valid_data[, c("X", "Y")])
+A_valid <- inla.spde.make.A(mesh = mesh, loc = coords.valid, group = group.valid) # the mesh which was used to train model
+
+
+s.index.valid <- inla.spde.make.index("s_valid", 
+                                     n.spde = spde$n.spde, 
+                                     n.group = length(unique(valid_data$YEAR))) 
+
+
+
+
+# ==== Build test validation stack ====
+
+if (region.name == "Wyoming") {
+  stk.valid <- inla.stack(
+  data = list(y = NA),
+  A = list(1, A_valid),
+  effects = list(data.frame(b0 = rep(1, nrow(valid_data)),
+                            
+                            dem = valid_data$dem, 
+                            slope = valid_data$slope, 
+                            aspect = valid_data$aspect, 
+                            tri = valid_data$tri, 
+                            
+                            ndvi.fall.pr = valid_data$ndvi.fall.pr,
+                            ndvi.winter.pr = valid_data$ndvi.winter.pr,
+                            ndvi.spring = valid_data$ndvi.spring,
+                            ndvi.summer = valid_data$ndvi.summer,
+
+                            soil.moisture.fall.pr = valid_data$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = valid_data$soil.moisture.winter.pr,
+                            soil.moisture.spring = valid_data$soil.moisture.spring,
+                            soil.moisture.summer = valid_data$soil.moisture.summer,
+                            
+                            Bio6 = valid_data$Bio6,
+                            Bio8 = valid_data$Bio8,
+                            Bio17 = valid_data$Bio17,
+                            Bio18 = valid_data$Bio18,
+                            
+                            dayT = valid_data$dayT
+                            ), 
+                 spatial = s.index.valid
+                 ),
+  tag = "valid"
+  )
+} else if (region.name == "Nevada") {
+  stk.valid <- inla.stack(
+  data = list(y = NA),
+  A = list(1, A_valid),
+  effects = list(data.frame(b0 = rep(1, nrow(valid_data)),
+                            
+                            dem = valid_data$dem, 
+                            slope = valid_data$slope, 
+                            aspect = valid_data$aspect, 
+                            tri = valid_data$tri, 
+                            
+                            ndvi.fall.pr = valid_data$ndvi.fall.pr,
+                            ndvi.winter.pr = valid_data$ndvi.winter.pr,
+                            ndvi.spring = valid_data$ndvi.spring,
+                            ndvi.summer = valid_data$ndvi.summer,
+
+                            soil.moisture.fall.pr = valid_data$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = valid_data$soil.moisture.winter.pr,
+                            soil.moisture.spring = valid_data$soil.moisture.spring,
+                            soil.moisture.summer = valid_data$soil.moisture.summer,
+                            
+                            Bio8 = valid_data$Bio8,
+                            Bio9 = valid_data$Bio9,
+                            Bio14 = valid_data$Bio14,
+                            Bio18 = valid_data$Bio18,
+                            
+                            dayT = valid_data$dayT
+                            ), 
+                 spatial = s.index.valid
+                 ),
+  tag = "valid"
+  )  
+} else {
+  stk.valid <- inla.stack(
+  data = list(y = NA),
+  A = list(1, A_valid),
+  effects = list(data.frame(b0 = rep(1, nrow(valid_data)),
+                            
+                            dem = valid_data$dem, 
+                            slope = valid_data$slope, 
+                            aspect = valid_data$aspect, 
+                            tri = valid_data$tri, 
+                            
+                            ndvi.fall.pr = valid_data$ndvi.fall.pr,
+                            ndvi.winter.pr = valid_data$ndvi.winter.pr,
+                            ndvi.spring = valid_data$ndvi.spring,
+                            ndvi.summer = valid_data$ndvi.summer,
+
+                            soil.moisture.fall.pr = valid_data$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = valid_data$soil.moisture.winter.pr,
+                            soil.moisture.spring = valid_data$soil.moisture.spring,
+                            soil.moisture.summer = valid_data$soil.moisture.summer,
+                            
+                            Bio8 = valid_data$Bio8,
+                            Bio9 = valid_data$Bio9,
+                            Bio17 = valid_data$Bio17,
+                            Bio19 = valid_data$Bio19,
+                            
+                            dayT = valid_data$dayT
+                            ), 
+                 spatial = s.index.valid
+                 ),
+  tag = "valid"
+  )  
+}
+
+
+
+
+
+
+
+# ==== Combine original and prediction-valid stack ====
+stk.full.valid <- inla.stack(stk.full, stk.valid)  # use previous training stack
+
+
+
+```
+
+```{r inla Valid}
+
+path.model.valid <- paste0("Models/", region.name, "/", survey.type, "/Model.INLA.", region.name, ".", survey.type, ".", research.year[5],"-", research.year[5]+1, "_Valid.Rds")
+
+# ==== Run INLA again to get predictions (not refitting!) ====
+
+if (!file.exists(path.model.valid)){
+  res.valid <- inla(
+    formula,  # same formula used in fitting
+    family = "zeroinflatedpoisson1",
+    data = inla.stack.data(stk.full.valid, spde = spde),  # same spde
+    control.predictor = list(
+      compute = TRUE,
+      A = inla.stack.A(stk.full.valid),
+      link = 1
+    ),
+    control.compute = list(config = TRUE,dic = TRUE, waic = TRUE),
+    control.mode = list(theta = res$mode$theta, restart = FALSE)  # use fitted parameters
+  )
+  saveRDS(res.valid, file = path.model.valid)
+} else {
+  res.valid <- readRDS(path.model.valid)
+}
+
+summary(res.valid)
+
+
+
+```
+
+```{r valid accuracy}
+# ==== Extract test predictions ====
+index.valid <- inla.stack.index(stk.full.valid, tag = "valid")$data
+
+
+years <- unique(valid_data$YEAR)
+
+for (yr in years) {
+  # Filter data for the current year, finding rows
+  idx_year <- which(valid_data$YEAR == yr)
+
+  valid_density <- res.valid$summary.fitted.values[index.valid[idx_year], "mean"]
+
+
+  # ==== Compare with real density ====
+  actual_density <- valid_data$MCDENSITY[idx_year]
+
+  # ==== Evaluate accuracy ====
+  rmse_val <- rmse(actual_density, valid_density)
+  mae_val <- mae(actual_density, valid_density)
+
+  cat("Year:", yr, "\n")
+  cat("RMSE:", round(rmse_val, 4), "\n")
+  cat("MAE :", round(mae_val, 4), "\n")
+}
+
+```
+
+
+
+
+
+```{r test data}
+year_test <- seq(research.year[1], research.year[5] + 1) # 5 training years + 1 validation year
+
+test_data <- data.frame()
+for (year in year_test){
+  path.survey.test <- paste0(root_folder, "SurveyData/grasshoppers_10192022/APHIS_split_GH_MC/GHMC_Survey_", year, "_", survey.type,"_", region.code, "_UTM_wabs.csv")
+  test_survey <- read.csv(path.survey.test)
+  test_survey <- test_survey[test_survey$STATE==region.code, c("X", "Y", "DATE","MCDENSITY")]
+  
+  if (nrow(test_survey) == 0) next
+
+
+  test_survey$DATE <- parse_date_time(test_survey$DATE, orders = c(
+  "Y/m/d H:M",   # e.g., 2003/8/31 0:00
+  "m/d/Y H:M",   # e.g., 8/31/2003 0:00
+  "Y-m-d H:M",   # e.g., 2003-08-31 00:00
+  "Y/m/d",       # fallback
+  "m/d/Y"        # fallback
+  ))
+
+  # Extract the year
+  test_survey$YEAR <- year(test_survey$DATE)
+
+  test_survey$group <- test_survey$YEAR - year_test[1] +1
+  
+  # samples in one pixel
+  test_xy <- test_survey[, c("X", "Y")]
+  
+  test_cells <- cellFromXY(template_dataMerge, test_xy)
+  test_survey$cell_id <- test_cells
+  
+  test_survey.ras <- test_survey %>%
+  group_by(cell_id) %>%
+  summarise(
+    MCDENSITY = round(mean(MCDENSITY, na.rm = TRUE)),
+    YEAR = first(YEAR),
+    group = first(group)
+    ) %>%
+  ungroup()
+  
+ 
+
+
+
+  test_xy_centers <- xyFromCell(template_dataMerge, test_survey.ras$cell_id)
+  test_survey.ras$X <- test_xy_centers[, 1]
+  test_survey.ras$Y <- test_xy_centers[, 2]
+
+  test_pest_name <- paste0(survey.type, "DENSITY")
+  test_survey.ras <- test_survey.ras[, c("X", "Y", "YEAR", "group", test_pest_name)]  
+  
+  
+  test_data <- rbind(test_data, test_survey.ras)
+}
+
+test_data <- test_data[!is.na(test_data$X) & !is.na(test_data$Y), ]
+```
+
+```{r test variables}
+dataset.test <- list()
+template_raster.test <- NULL
+
+for (year in year_test){
+  
+  path.dataset.test <- paste0("Datasets/", region.name, "/Dataset.", region.name, ".", year, "_biovar_UTM_fall_pr_summer.Rds")
+  filter_data.test <- readRDS(path.dataset.test)
+  filter_data.test <- filter_data.test[names(filter_data.test) %in% wanted_names]
+  
+  path.dayT.test <- paste0(root_folder, "DayinRangeTEco/", region.name, "/", region.code, "_DaysInRange_EcoYear_", year, "_UTM.tif")
+  if (file.exists(path.dayT.test)) {
+    dayT_raster.test <- raster::raster(path.dayT.test)
+    if (inherits(dayT_raster.test, "Raster")) {
+      filter_data.test$dayT <- dayT_raster.test
+    }
+  }
+  
+  # Pick a template raster (first valid one)
+  if (is.null(template_raster.test)) {
+    for (r in filter_data.test) {
+      if (inherits(r, "RasterLayer")) {
+        template_raster.test <- r
+        break
+      }
+    }
+  }
+  
+  
+  
+  dataset.test[[paste0('year.', year)]] <- filter_data.test
+}
+
+
+
+# bio-climate variables images have different size
+# Resample all rasters to match template
+for (year_name.test in names(dataset.test)) {
+  selected_data.test <- dataset.test[[year_name.test]]
+  
+  aligned_data.test <- list()
+  
+  for (name in wanted_names) {
+    if (!is.null(selected_data.test[[name]]) && inherits(selected_data.test[[name]], "Raster")) {
+      aligned_data.test[[name]] <- raster::resample(selected_data.test[[name]], template_raster.test, method = "bilinear")
+    } else {
+      # Fill with NA if missing or not a RasterLayer
+      aligned_data.test[[name]] <- raster(template_raster.test)
+      aligned_data.test[[name]][] <- NA
+    }
+  }
+  
+  dataset.test[[year_name.test]] <- aligned_data.test
+}
+
+
+
+
+# normalize
+for (i in 1:length(dataset.test)) {
+  for (j in 1:length(dataset.test[[i]])) {
+    dataset.test[[i]][[j]] <- data.normalize(dataset.test[[i]][[j]])
+  }
+}
+
+test_data.sf <- sf::st_as_sf(test_data, coords = c("X","Y"), crs=research.crs)
+```
+
+```{r get test climate values}
+
+# define function
+get.climateVars.yearly.test <- function(geometry, year, varName){
+  year <- year_test[year]
+  values <- list()
+  for (y in unique(year)){
+    values[year==y] <- get.climateVars(dataset.test[[paste0('year.', y)]][[varName]], geometry[year==y])
+  }
+  return (as.numeric(values))
+}
+
+
+
+# get image values
+test_data$dem <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'dem')
+test_data$slope <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'slope')
+test_data$aspect <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'aspect')
+test_data$tri <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'tri')
+
+test_data$ndvi.fall.pr <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'ndvi.fall.pr')
+test_data$ndvi.winter.pr <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'ndvi.winter.pr')
+test_data$ndvi.spring <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'ndvi.spring')
+test_data$ndvi.summer <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'ndvi.summer')
+
+test_data$soil.moisture.fall.pr <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'soil.moisture.fall.pr')
+test_data$soil.moisture.winter.pr <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'soil.moisture.winter.pr')
+test_data$soil.moisture.spring <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'soil.moisture.spring')
+test_data$soil.moisture.summer <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'soil.moisture.summer')
+
+test_data$dayT <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'dayT')
+
+if (region.name == "Wyoming") {
+  test_data$Bio6 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio6')
+  test_data$Bio8 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio8')
+  test_data$Bio17 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio17')
+  test_data$Bio18 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio18')
+} else if (region.name == "Nevada") {
+  test_data$Bio8 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio8')
+  test_data$Bio9 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio9')
+  test_data$Bio14 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio14')
+  test_data$Bio18 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio18')  
+} else {
+  test_data$Bio8 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio8')
+  test_data$Bio9 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio9')
+  test_data$Bio17 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio17')
+  test_data$Bio19 <- get.climateVars.yearly.test(test_data.sf$geometry, test_data.sf$group, 'Bio19')  
+}
+
+```
+
+
+```{r test data processing}
+# ==== Create binary labels from GHDENSITY ====
+# Assuming: 1 = presence (MCDENSITY > 0), 0 = absence
+test_data <- test_data %>%
+  mutate(label = ifelse(MCDENSITY > 0, 1, 0))
+
+# ==== Build projection matrix for new coordinates ====
+group.test <- test_data$YEAR - min(test_data$YEAR) + 1
+coords <- as.matrix(test_data[, c("X", "Y")])
+A_pred <- inla.spde.make.A(mesh = mesh, loc = coords, group = group.test) # the mesh which was used to train model
+
+
+s.index.test <- inla.spde.make.index("s_test", 
+                                     n.spde = spde$n.spde, 
+                                     n.group = length(unique(test_data$YEAR))) 
+
+
+```
+
+
+
+
+
+```{r test stack for est}
+
+# ==== Build test prediction stack ====
+if (region.name == "Wyoming") {
+  stk.test <- inla.stack(
+  data = list(y = test_data$MCDENSITY),
+  A = list(1, A_pred),
+  effects = list(data.frame(b0 = rep(1, nrow(test_data)),
+                            
+                            dem = test_data$dem, 
+                            slope = test_data$slope, 
+                            aspect = test_data$aspect, 
+                            tri = test_data$tri, 
+                            
+                            ndvi.fall.pr = test_data$ndvi.fall.pr,
+                            ndvi.winter.pr = test_data$ndvi.winter.pr,
+                            ndvi.spring = test_data$ndvi.spring,
+                            ndvi.summer = test_data$ndvi.summer,
+
+                            soil.moisture.fall.pr = test_data$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = test_data$soil.moisture.winter.pr,
+                            soil.moisture.spring = test_data$soil.moisture.spring,
+                            soil.moisture.summer = test_data$soil.moisture.summer,
+                            
+                            Bio6 = test_data$Bio6,
+                            Bio8 = test_data$Bio8,
+                            Bio17 = test_data$Bio17,
+                            Bio18 = test_data$Bio18,
+                            
+                            dayT = test_data$dayT
+                            
+                            ), 
+                 spatial = s.index.test
+                 ),
+  tag = "test"
+  )
+
+} else if (region.name == "Nevada") {
+  stk.test <- inla.stack(
+  data = list(y = test_data$MCDENSITY),
+  A = list(1, A_pred),
+  effects = list(data.frame(b0 = rep(1, nrow(test_data)),
+                            
+                            dem = test_data$dem, 
+                            slope = test_data$slope, 
+                            aspect = test_data$aspect, 
+                            tri = test_data$tri, 
+                            
+                            ndvi.fall.pr = test_data$ndvi.fall.pr,
+                            ndvi.winter.pr = test_data$ndvi.winter.pr,
+                            ndvi.spring = test_data$ndvi.spring,
+                            ndvi.summer = test_data$ndvi.summer,
+
+                            soil.moisture.fall.pr = test_data$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = test_data$soil.moisture.winter.pr,
+                            soil.moisture.spring = test_data$soil.moisture.spring,
+                            soil.moisture.summer = test_data$soil.moisture.summer,
+                            
+                            Bio8 = test_data$Bio8,
+                            Bio9 = test_data$Bio9,
+                            Bio14 = test_data$Bio14,
+                            Bio18 = test_data$Bio18,
+                            
+                            dayT = test_data$dayT
+                            
+                            ), 
+                 spatial = s.index.test
+                 ),
+  tag = "test"
+  )  
+} else {
+  stk.test <- inla.stack(
+  data = list(y = test_data$MCDENSITY),
+  A = list(1, A_pred),
+  effects = list(data.frame(b0 = rep(1, nrow(test_data)),
+                            
+                            dem = test_data$dem, 
+                            slope = test_data$slope, 
+                            aspect = test_data$aspect, 
+                            tri = test_data$tri, 
+                            
+                            ndvi.fall.pr = test_data$ndvi.fall.pr,
+                            ndvi.winter.pr = test_data$ndvi.winter.pr,
+                            ndvi.spring = test_data$ndvi.spring,
+                            ndvi.summer = test_data$ndvi.summer,
+
+                            soil.moisture.fall.pr = test_data$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = test_data$soil.moisture.winter.pr,
+                            soil.moisture.spring = test_data$soil.moisture.spring,
+                            soil.moisture.summer = test_data$soil.moisture.summer,
+                            
+                            Bio8 = test_data$Bio8,
+                            Bio9 = test_data$Bio9,
+                            Bio17 = test_data$Bio17,
+                            Bio19 = test_data$Bio19,
+                            
+                            dayT = test_data$dayT
+                            
+                            ), 
+                 spatial = s.index.test
+                 ),
+  tag = "test"
+  )  
+}
+
+
+
+
+
+
+
+```
+
+
+
+```{r test map data processing}
+
+path.pred.grid.testMap <- paste0("/Datasets/", region.name, "/", survey.type, "/Pred.grid.", region.name, ".", survey.type, ".", research.year[1],"-", research.year[5]+1, "testMap.Rds")
+
+if (!file.exists(path.pred.grid.testMap)){
+  
+  pred.grid <- read.csv(paste0(root_folder, bound_folder, "/", region.name, "_grid_1km_UTM.csv"))
+  check_results.test <- list()
+
+  for (year in year_test) {
+    test.map <- pred.grid[check.isna.climateVars(dataset.test[[paste0('year.', year)]], pred.grid),]
+    test.map$YEAR <- year-year_test[1]+1  # add year
+  
+    # to sf
+    test.select.sf <- st_as_sf(test.map, coords = c("X", "Y"), crs=research.crs)
+  
+    # save into list
+    check_results.test[[as.character(year)]] <- test.select.sf
+  }
+  
+  # combine all data
+  test.map.sf <- do.call(rbind, check_results.test) # group number and POINT(x,y)
+  
+  test.map.sf$dem <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'dem')
+  test.map.sf$slope <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'slope')
+  test.map.sf$aspect <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'aspect')
+  test.map.sf$tri <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'tri')
+  
+  test.map.sf$ndvi.fall.pr <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'ndvi.fall.pr')
+  test.map.sf$ndvi.winter.pr <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'ndvi.winter.pr')
+  test.map.sf$ndvi.spring <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'ndvi.spring')
+  test.map.sf$ndvi.summer <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'ndvi.summer')
+  
+  test.map.sf$soil.moisture.fall.pr <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'soil.moisture.fall.pr')
+  test.map.sf$soil.moisture.winter.pr <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'soil.moisture.winter.pr')
+  test.map.sf$soil.moisture.spring <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'soil.moisture.spring')
+  test.map.sf$soil.moisture.summer <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'soil.moisture.summer')
+  
+  test.map.sf$dayT <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'dayT')
+  
+  if (region.name == "Wyoming") {
+    test.map.sf$Bio6 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio6')
+    test.map.sf$Bio8 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio8')
+    test.map.sf$Bio17 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio17')
+    test.map.sf$Bio18 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio18')
+  } else if (region.name == "Nevada") {
+    test.map.sf$Bio8 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio8')
+    test.map.sf$Bio9 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio9')
+    test.map.sf$Bio14 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio14')
+    test.map.sf$Bio18 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio18')
+  } else {
+    test.map.sf$Bio8 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio8')
+    test.map.sf$Bio9 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio9')
+    test.map.sf$Bio17 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio17')
+    test.map.sf$Bio19 <- get.climateVars.yearly.test(test.map.sf$geometry, test.map.sf$YEAR, 'Bio19')
+  }
+  
+  
+  saveRDS(test.map.sf, file = path.pred.grid.testMap)
+  
+} else {
+  test.map.sf <- readRDS(path.pred.grid.testMap)
+}
+
+
+```
+
+
+
+```{r map matrix}
+
+# ==== Build projection matrix for new coordinates ====
+group.test.map <- test.map.sf$YEAR
+coords.map <- st_coordinates(test.map.sf$geometry)
+A_pred.map <- inla.spde.make.A(mesh = mesh, loc = coords.map, group = group.test.map) # the mesh which was used to train model
+
+
+# s.index.test.map <- inla.spde.make.index("s_test.map", 
+#                                      n.spde = spde$n.spde, 
+#                                      n.group = length(unique(test.map.sf$YEAR)))
+
+# ==== Build test map prediction stack ====
+if (region.name == "Wyoming") {
+  stk.test.map <- inla.stack(
+  data = list(y = NA),
+  A = list(1, A_pred.map),
+  effects = list(data.frame(b0 = rep(1, nrow(test.map.sf)),
+                            
+                            dem = test.map.sf$dem, 
+                            slope = test.map.sf$slope, 
+                            aspect = test.map.sf$aspect, 
+                            tri = test.map.sf$tri, 
+                            
+                            ndvi.fall.pr = test.map.sf$ndvi.fall.pr,
+                            ndvi.winter.pr = test.map.sf$ndvi.winter.pr,
+                            ndvi.spring = test.map.sf$ndvi.spring,
+                            ndvi.summer = test.map.sf$ndvi.summer,
+
+                            soil.moisture.fall.pr = test.map.sf$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = test.map.sf$soil.moisture.winter.pr,
+                            soil.moisture.spring = test.map.sf$soil.moisture.spring,
+                            soil.moisture.summer = test.map.sf$soil.moisture.summer,
+                            
+                            Bio6 = test.map.sf$Bio6,
+                            Bio8 = test.map.sf$Bio8,
+                            Bio17 = test.map.sf$Bio17,
+                            Bio18 = test.map.sf$Bio18,
+                            
+                            dayT = test.map.sf$dayT
+                            ), 
+                 spatial = s.index.test
+                 ),
+  tag = "test.map"
+  )
+} else if (region.name == "Nevada") {
+  stk.test.map <- inla.stack(
+  data = list(y = NA),
+  A = list(1, A_pred.map),
+  effects = list(data.frame(b0 = rep(1, nrow(test.map.sf)),
+                            
+                            dem = test.map.sf$dem, 
+                            slope = test.map.sf$slope, 
+                            aspect = test.map.sf$aspect, 
+                            tri = test.map.sf$tri, 
+                            
+                            ndvi.fall.pr = test.map.sf$ndvi.fall.pr,
+                            ndvi.winter.pr = test.map.sf$ndvi.winter.pr,
+                            ndvi.spring = test.map.sf$ndvi.spring,
+                            ndvi.summer = test.map.sf$ndvi.summer,
+
+                            soil.moisture.fall.pr = test.map.sf$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = test.map.sf$soil.moisture.winter.pr,
+                            soil.moisture.spring = test.map.sf$soil.moisture.spring,
+                            soil.moisture.summer = test.map.sf$soil.moisture.summer,
+                            
+                            Bio8 = test.map.sf$Bio8,
+                            Bio9 = test.map.sf$Bio9,
+                            Bio14 = test.map.sf$Bio14,
+                            Bio18 = test.map.sf$Bio18,
+                            
+                            dayT = test.map.sf$dayT
+                            ), 
+                 spatial = s.index.test
+                 ),
+  tag = "test.map"
+  )  
+} else {
+  stk.test.map <- inla.stack(
+  data = list(y = NA),
+  A = list(1, A_pred.map),
+  effects = list(data.frame(b0 = rep(1, nrow(test.map.sf)),
+                            
+                            dem = test.map.sf$dem, 
+                            slope = test.map.sf$slope, 
+                            aspect = test.map.sf$aspect, 
+                            tri = test.map.sf$tri, 
+                            
+                            ndvi.fall.pr = test.map.sf$ndvi.fall.pr,
+                            ndvi.winter.pr = test.map.sf$ndvi.winter.pr,
+                            ndvi.spring = test.map.sf$ndvi.spring,
+                            ndvi.summer = test.map.sf$ndvi.summer,
+
+                            soil.moisture.fall.pr = test.map.sf$soil.moisture.fall.pr,
+                            soil.moisture.winter.pr = test.map.sf$soil.moisture.winter.pr,
+                            soil.moisture.spring = test.map.sf$soil.moisture.spring,
+                            soil.moisture.summer = test.map.sf$soil.moisture.summer,
+                            
+                            Bio8 = test.map.sf$Bio8,
+                            Bio9 = test.map.sf$Bio9,
+                            Bio17 = test.map.sf$Bio17,
+                            Bio19 = test.map.sf$Bio19,
+                            
+                            dayT = test.map.sf$dayT
+                            ), 
+                 spatial = s.index.test
+                 ),
+  tag = "test.map"
+  )  
+}
+
+
+
+
+
+
+
+# ==== Combine original and test prediction stack ====
+
+stk.full.tst <- inla.stack(stk.test, stk.test.map)
+
+```
+
+```{r test Model formula}
+if (region.name == "Wyoming") {
+  test_rprior <- list(theta = list(prior = "pccor1", param = c(0.4, 0.6)))
+test_formula <- y ~ 0 + b0 +
+  dem + slope + aspect + tri +
+  ndvi.fall.pr + ndvi.winter.pr + ndvi.spring + ndvi.summer +
+  soil.moisture.fall.pr + soil.moisture.winter.pr + soil.moisture.spring + soil.moisture.summer +
+  Bio6 + Bio8 + Bio17 + Bio18 +
+  dayT +
+  
+  f(s_test,model = spde, group = s_test.group,
+  control.group = list(model = "ar1", hyper = test_rprior)
+  )
+
+} else if (region.name == "Nevada") {
+  test_rprior <- list(theta = list(prior = "pccor1", param = c(0.8, 0.4)))
+test_formula <- y ~ 0 + b0 +
+  dem + slope + aspect + tri +
+  ndvi.fall.pr + ndvi.winter.pr + ndvi.spring + ndvi.summer +
+  soil.moisture.fall.pr + soil.moisture.winter.pr + soil.moisture.spring + soil.moisture.summer +
+  Bio8 + Bio9 + Bio14 + Bio18 +
+  dayT +
+  
+  f(s_test,model = spde, group = s_test.group,
+  control.group = list(model = "ar1", hyper = test_rprior)
+  )
+  
+} else {
+  test_rprior <- list(theta = list(prior = "pccor1", param = c(0.4, 0.6)))
+test_formula <- y ~ 0 + b0 +
+  dem + slope + aspect + tri +
+  ndvi.fall.pr + ndvi.winter.pr + ndvi.spring + ndvi.summer +
+  soil.moisture.fall.pr + soil.moisture.winter.pr + soil.moisture.spring + soil.moisture.summer +
+  Bio8 + Bio9 + Bio17 + Bio19 +
+  dayT +
+  
+  f(s_test,model = spde, group = s_test.group,
+  control.group = list(model = "ar1", hyper = test_rprior)
+  )
+  
+}
+
+
+
+```
+
+
+```{r inla test map}
+
+path.model.test.map <- paste0("Models/", region.name, "/", survey.type, "/Model.INLA.", region.name, ".", survey.type, ".", research.year[1],"-", research.year[5]+1, "testMap.Rds")
+
+# ==== Run INLA again to get predictions (not refitting!) ====
+
+if (!file.exists(path.model.test.map)){
+  res.test.map <- inla(
+    test_formula,  # same formula used in fitting
+    family = "zeroinflatedpoisson1",
+    data = inla.stack.data(stk.full.tst, spde = spde),  # same spde
+    control.predictor = list(
+      compute = TRUE,
+      A = inla.stack.A(stk.full.tst),
+      link = 1
+    ),
+    # control.mode = list(result = res, fixed = TRUE)  # use fitted parameters
+    control.mode = list(theta = res$mode$theta, restart = FALSE)
+  )
+  saveRDS(res.test.map, file = path.model.test.map)
+} else {
+  res.test.map <- readRDS(path.model.test.map)
+}
+
+summary(res.test.map)
+
+```
+
+```{r map plot preparation}
+
+index.map <- inla.stack.index(stack = stk.full.tst, tag = "test.map")$data
+
+dp.map <- data.frame(
+  x = sf::st_coordinates(test.map.sf)[, 1],
+  y = sf::st_coordinates(test.map.sf)[, 2],
+  time = test.map.sf$YEAR
+)
+dp.map <- data.frame(dp.map)
+dp.map$pred_mean <- res.test.map$summary.fitted.values[index.map, "mean"] # responds scale
+dp.map$pred_ll <- res.test.map$summary.fitted.values[index.map, "0.025quant"]
+dp.map$pred_median <- res.test.map$summary.fitted.values[index.map, "0.5quant"]
+dp.map$pred_ul <- res.test.map$summary.fitted.values[index.map, "0.975quant"]
+
+dp.map$pred_sd <- res.test.map$summary.fitted.values[index.map, "sd"]
+
+```
+
+
+```{r map plot mean png}
+dpm.map <- melt(dp.map,
+  id.vars = c("x", "y", "time"),
+  measure.vars = c("pred_mean", "pred_ll", "pred_median", "pred_ul")
+)
+# head(dpm.map)
+
+pred_mean_data.map <- dpm.map[dpm.map$variable == "pred_mean", ]
+
+
+ggplot(research.boundary) + geom_sf() + coord_sf(datum = NA) +
+  geom_tile(data = dpm.map, aes(x = x, y = y, fill = value)) +
+  labs(x = "", y = "") +
+  facet_wrap(variable ~ time) +
+  scale_fill_viridis("MCDENSITY") +
+  theme_bw()
+
+
+
+
+```
+
+```{r map plot sd png}
+dpm.map.sd <- melt(dp.map,
+  id.vars = c("x", "y", "time"),
+  measure.vars = c("pred_sd")
+)
+# head(dpm.map)
+
+pred_sd_data.map <- dpm.map.sd[dpm.map.sd$variable == "pred_sd", ]
+
+ggplot(research.boundary) + geom_sf() + coord_sf(datum = NA) +
+  geom_tile(data = dpm.map.sd, aes(x = x, y = y, fill = value)) +
+  labs(x = "", y = "") +
+  facet_wrap(variable ~ time) +
+  scale_fill_viridis("MCDENSITY") +
+  theme_bw()
+
+
+
+```
+
+
+```{r save mean tif map}
+
+create_raster_per_year.test <- function(data, value_col, year, output_dir, image.type) {
+  # select year
+  data_year <- data[data$time == year, ]
+
+  raster_data <- data.frame(
+    x = data_year$x,
+    y = data_year$y,
+    value = data_year$value
+  )
+
+  # generate raster
+  r <- rasterFromXYZ(raster_data)
+
+  # set projection
+  crs(r) <- st_crs(research.boundary)$proj4string
+
+  # save tiff
+  file_name <- paste0(output_dir, "/", value_col, "/Plot.INLA.", region.name, ".", survey.type, ".", research.year[1], "_", research.year[5]+1,  "_",image.type, ".", year,".tiff") # 5 training + 1 valid year -> 6 maps
+  writeRaster(r, file_name, format = "GTiff", overwrite = TRUE)
+  cat("save：", file_name, "\n")
+}
+
+
+
+
+output_dir <- paste0("Plots/", region.name, "/", survey.type)
+
+
+# mean
+for (year in unique(pred_mean_data.map$time)) {
+  create_raster_per_year.test(pred_mean_data.map, "Estimated_Map", year, output_dir,"mean")
+}
+
+
+
+```
+
+
+
+```{r save sd tif map}
+
+for (year in unique(pred_sd_data.map$time)) {
+  create_raster_per_year.test(pred_sd_data.map, "Estimated_Map-sd", year, output_dir,"sd")
+}
+
+```
+

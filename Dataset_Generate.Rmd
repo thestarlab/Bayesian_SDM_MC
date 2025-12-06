@@ -1,0 +1,313 @@
+---
+title: "Dataset Generate"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+params:
+  year: 2002
+  type: MC
+  region: Wyoming
+  normalize: TRUE
+  work.dir: /projects/MC_prediction
+  data.dir: /projects/MC-data/
+  
+ 
+
+
+---
+
+
+```{r packages, message=FALSE, warning=FALSE}
+library(raster)  
+library(sp)    
+library(sf)
+library(ggplot2)
+library(spatstat)
+library(daymetr)
+library(dismo)
+library(INLA)
+library(inlabru)
+library(raster)
+
+
+```
+
+
+
+
+```{r data load}
+set.seed(1)
+
+# parameters
+year <- params$year
+year.pr <- year-1
+
+survey.type <- params$type 
+region.name <- params$region 
+if (region.name == "Nevada") {
+  region.code <- "NV"
+  }else if (region.name == "Wyoming") {
+    region.code <-  "WY"
+  }else{
+    region.code <-  "ID"
+  }
+
+print ("year, survey type, region:")
+paste(year, survey.type, region.name)
+
+setwd(params$work.dir) 
+root_folder <- params$data.dir
+paste("Working directory: ", params$work.dir)
+paste("Dataset directory: ", params$data.dir)
+
+
+
+if (region.name == "Nevada") {
+  bound_folder <- "NV_data"
+  }else if (region.name == "Wyoming") {
+    bound_folder  <-  "WY_data"
+  }else{
+    bound_folder  <-  "ID_data"
+  }
+
+
+
+# boundary
+research.boundary <- sf::st_read(dsn = paste0(root_folder, bound_folder, "/cb_2018_us_state_500k_",region.name,"_UTM.shp"),
+                                layer = paste0("cb_2018_us_state_500k_", region.name,"_UTM"), quiet=TRUE)
+research.crs <- raster::crs(research.boundary)
+
+
+```
+
+```{r generate topo}
+# generate topo tif
+
+demUS <- raster(paste0(root_folder, bound_folder,"/DEM_", region.code, "_UTM.tif"))
+triUS <- terrain(demUS, opt = "TRI", unit = "radians")
+
+
+file_tri <- paste0(root_folder, "TopoData/TRI_",region.code,"_UTM.tif")
+
+if (!file.exists(file_tri)){
+  triUS <- terrain(demUS, opt = "TRI", unit = "radians")
+  writeRaster(triUS, filename = file_tri, format = "GTiff", overwrite = TRUE)
+} else {
+  triUS <- raster(file_tri)
+}  
+```
+
+```{r climate_datasets}
+crop.dataset <- function(year, research.crs, research.boundary){
+  extractByMask <- function(raster){
+    boundary <- st_transform(research.boundary, crs(raster))
+    return (suppressWarnings(mask(crop(raster, extent(boundary)), boundary)))
+  }
+  
+    ## template-> projection
+  temp <- raster(paste0(root_folder, bound_folder, "/template_", region.name, "_UTM.tif"))
+  temp <- extractByMask(temp)
+  
+  # dem, slope, aspect, ndvi, soil.moisture, tri, Bioclimate
+  dem <- raster(paste0(root_folder, bound_folder, "/DEM_", region.code, "_UTM.tif"))
+  dem <- extractByMask(dem)
+  
+  tri <- raster(paste0(root_folder, "TopoData/TRI_",region.code,"_UTM.tif"))
+  tri <- extractByMask(tri)
+  
+  slope <- raster(paste0(root_folder, bound_folder, "/Slope_",region.code,"_UTM.tif"))
+  slope <- extractByMask(slope)
+  
+  aspect <- raster(paste0(root_folder, bound_folder, "/aspect_",region.code,"_UTM.tif"))
+  aspect <- extractByMask(aspect)
+  
+  
+  # NDVI, 4 quarters (from previous fall to this summer)
+  ndvi.fall.pr <- raster(paste0(root_folder, "Quarter/NDVI_", region.name, "_fall_", year.pr, "_UTM.tif"))
+  ndvi.fall.pr <- extractByMask(ndvi.fall.pr)
+  
+  ndvi.winter.pr <- raster(paste0(root_folder, "Quarter/NDVI_", region.name, "_winter_", year.pr, "_UTM.tif"))
+  ndvi.winter.pr <- extractByMask(ndvi.winter.pr)
+  
+  ndvi.spring <- raster(paste0(root_folder, "Quarter/NDVI_", region.name, "_spring_", year, "_UTM.tif"))
+  ndvi.spring <- extractByMask(ndvi.spring)
+  
+  ndvi.summer <- raster(paste0(root_folder, "Quarter/NDVI_", region.name, "_summer_", year, "_UTM.tif"))
+  ndvi.summer <- extractByMask(ndvi.summer)
+  
+  
+  
+  # soil moisture, 4 quarters
+  
+  soil.moisture.fall.pr <- raster(paste0(root_folder, "Quarter/SoilMoisture_", region.name, "_fall_", year.pr, "_mean_UTM.tif"))
+  soil.moisture.fall.pr <- extractByMask(soil.moisture.fall.pr)  
+
+  soil.moisture.winter.pr <- raster(paste0(root_folder, "Quarter/SoilMoisture_", region.name, "_winter_", year.pr, "_mean_UTM.tif"))
+  soil.moisture.winter.pr <- extractByMask(soil.moisture.winter.pr)  
+  
+  soil.moisture.spring <- raster(paste0(root_folder, "Quarter/SoilMoisture_", region.name, "_spring_", year, "_mean_UTM.tif"))
+  soil.moisture.spring <- extractByMask(soil.moisture.spring)  
+  
+  soil.moisture.summer <- raster(paste0(root_folder, "Quarter/SoilMoisture_", region.name, "_summer_", year, "_mean_UTM.tif"))
+  soil.moisture.summer <- extractByMask(soil.moisture.summer)  
+  
+  
+  
+  # bioclimate, 19 variables
+  
+  Bio1 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio1_", year, ".tif"))
+  Bio1 <- extractByMask(Bio1)
+  
+  Bio2 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio2_", year, ".tif"))
+  Bio2 <- extractByMask(Bio2)
+  
+  Bio3 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio3_", year, ".tif"))
+  Bio3 <- extractByMask(Bio3)
+  
+  Bio4 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio4_", year, ".tif"))
+  Bio4 <- extractByMask(Bio4)
+  
+  Bio5 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio5_", year, ".tif"))
+  Bio5 <- extractByMask(Bio5)
+  
+  Bio6 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio6_", year, ".tif"))
+  Bio6 <- extractByMask(Bio6)
+  
+  Bio7 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio7_", year, ".tif"))
+  Bio7 <- extractByMask(Bio7)
+  
+  Bio8 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio8_", year, ".tif"))
+  Bio8 <- extractByMask(Bio8)
+  
+  Bio9 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio9_", year, ".tif"))
+  Bio9 <- extractByMask(Bio9)
+  
+  Bio10 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio10_", year, ".tif"))
+  Bio10 <- extractByMask(Bio10)
+  
+  Bio11 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio11_", year, ".tif"))
+  Bio11 <- extractByMask(Bio11)
+  
+  Bio12 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio12_", year, ".tif"))
+  Bio12 <- extractByMask(Bio12)
+  
+  Bio13 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio13_", year, ".tif"))
+  Bio13 <- extractByMask(Bio13)
+  
+  Bio14 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio14_", year, ".tif"))
+  Bio14 <- extractByMask(Bio14)
+  
+  Bio15 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio15_", year, ".tif"))
+  Bio15 <- extractByMask(Bio15)
+  
+  Bio16 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio16_", year, ".tif"))
+  Bio16 <- extractByMask(Bio16)
+  
+  Bio17 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio17_", year, ".tif"))
+  Bio17 <- extractByMask(Bio17)
+  
+  Bio18 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio18_", year, ".tif"))
+  Bio18 <- extractByMask(Bio18)
+  
+  Bio19 <- raster(paste0(root_folder, "Biovar19/", region.name, "/", year, "/Bio19_", year, ".tif"))
+  Bio19 <- extractByMask(Bio19)
+  
+  
+  project.back <- function(raster){
+    raster <- projectRaster(raster, to=temp, method="ngb")
+    raster <- projectRaster(raster, crs=research.crs, method="ngb")
+    return (raster)
+  }
+  dem <- project.back(dem)
+  aspect <- project.back(aspect)
+  slope <- project.back(slope)
+  tri <- project.back(tri) # tri
+  
+  ndvi.fall.pr <- project.back(ndvi.fall.pr)
+  ndvi.winter.pr <- project.back(ndvi.winter.pr)
+  ndvi.spring <- project.back(ndvi.spring)
+  ndvi.summer <- project.back(ndvi.summer)
+  
+  soil.moisture.fall.pr <- project.back(soil.moisture.fall.pr)
+  soil.moisture.winter.pr <- project.back(soil.moisture.winter.pr)
+  soil.moisture.spring <- project.back(soil.moisture.spring)
+  soil.moisture.summer <- project.back(soil.moisture.summer)
+  
+  Bio1 <- project.back(Bio1)
+  Bio2 <- project.back(Bio2)
+  Bio3 <- project.back(Bio3)
+  Bio4 <- project.back(Bio4)
+  Bio5 <- project.back(Bio5)
+  Bio6 <- project.back(Bio6)
+  Bio7 <- project.back(Bio7)
+  Bio8 <- project.back(Bio8)
+  Bio9 <- project.back(Bio9)
+  Bio10 <- project.back(Bio10)
+  
+  Bio11 <- project.back(Bio11)
+  Bio12 <- project.back(Bio12)
+  Bio13 <- project.back(Bio13)
+  Bio14 <- project.back(Bio14)
+  Bio15 <- project.back(Bio15)
+  Bio16 <- project.back(Bio16)
+  Bio17 <- project.back(Bio17)
+  Bio18 <- project.back(Bio18)
+  Bio19 <- project.back(Bio19)
+  
+  return (c(dem=dem, aspect=aspect, slope=slope, tri=tri,
+            
+            
+            ndvi.fall.pr=ndvi.fall.pr, 
+            ndvi.winter.pr=ndvi.winter.pr, 
+            ndvi.spring=ndvi.spring, 
+            ndvi.summer=ndvi.summer,
+            
+            
+            soil.moisture.fall.pr=soil.moisture.fall.pr,
+            soil.moisture.winter.pr=soil.moisture.winter.pr,
+            soil.moisture.spring=soil.moisture.spring,
+            soil.moisture.summer=soil.moisture.summer,
+            
+            Bio1=Bio1, Bio2=Bio2, Bio3=Bio3, Bio4=Bio4, Bio5=Bio5, Bio6=Bio6,
+            Bio7=Bio7, Bio8=Bio8, Bio9=Bio9, Bio10=Bio10, Bio11=Bio11, Bio12=Bio12,
+            Bio13=Bio13, Bio14=Bio14, Bio15=Bio15, Bio16=Bio16, Bio17=Bio17, 
+            Bio18=Bio18, Bio19=Bio19))
+}
+
+get.climateVars <- function(data, geometry){
+  # Extract pixel value from data for given location (geometry)
+  values <- raster::extract(data, st_as_sf(geometry, crs=research.crs))
+  return (values)
+}
+# check NAN
+check.isna.climateVars <- function(dataset, loc){
+  loc_idx <- rep(TRUE, nrow(loc))
+  for (idx in 1:length(dataset)){
+    values <- get.climateVars(dataset[[idx]], SpatialPoints(coords = loc))
+    if (any(is.na(values))) loc_idx <- loc_idx & !is.na(values)
+  }
+  return (loc_idx)
+}
+```
+
+
+
+```{r generate_dataset}
+
+# Generate datasets for covariates
+path.dataset <- paste0("Datasets/Dataset.", region.name, ".", year, "_biovar_UTM_fall_pr_summer.Rds")
+
+
+if (!file.exists(path.dataset)){
+  dataset <- crop.dataset(year, research.crs, research.boundary) 
+  saveRDS(dataset, file = path.dataset)
+} else {
+  dataset <- readRDS(path.dataset)
+}
+
+
+
+```
+
+
