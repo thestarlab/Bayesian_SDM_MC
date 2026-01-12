@@ -17,7 +17,7 @@ A rolling-window approach is used to generate estimated distribution maps for Mo
 3. Interactive Visualization
 
 File: MC.html
-An interactive web interface for exploring the estimated Mormon cricket distribution maps from 2002–2020 across Wyoming (WY), Nevada (NV), and Idaho (ID).
+The code of an interactive web interface for exploring the estimated Mormon cricket distribution maps from 2002–2020 across Wyoming (WY), Nevada (NV), and Idaho (ID). To view the maps, using the link: https://www.spatstat.com/Bayesian_SDM_MC/MC.html
 
 4. Data Release
 
