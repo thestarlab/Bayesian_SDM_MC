@@ -1,6 +1,6 @@
 Project Overview
 
-This repository includes scripts and data products used to generate environmental covariates, fit a spatiotemporal Bayesian species distribution model for Mormon cricket, and visualize estimated distribution maps.
+This repository includes scripts and data products used to generate environmental covariates and fit a spatiotemporal Bayesian species distribution model for Mormon cricket. The resulting estimated distribution maps are available through an interactive web interface.
 
 1. Environmental Covariate Dataset Generation
 
